@@ -1,0 +1,10 @@
+_base_: ../base.yaml
+
+INPUT:
+  AUG_PROFILE: weak
+
+SOLVER:
+  OPTIMIZER_NAME: Adam
+  BASE_LR: 3.0e-4
+  WEIGHT_DECAY: 5.0e-4
+  SCHEDULER: step

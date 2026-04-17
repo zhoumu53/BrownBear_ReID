@@ -1,0 +1,11 @@
+_base_: ../base.yaml
+
+INPUT:
+  AUG_PROFILE: strong
+
+SOLVER:
+  OPTIMIZER_NAME: AdamW
+  BASE_LR: 1.0e-4
+  WEIGHT_DECAY: 0.05
+  SCHEDULER: cosine_warmup
+  WARMUP_EPOCHS: 5
