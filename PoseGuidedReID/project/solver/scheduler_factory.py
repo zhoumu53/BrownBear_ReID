@@ -38,8 +38,24 @@ def create_scheduler_old(cfg, optimizer):
     return lr_scheduler
 
 def create_scheduler(cfg, optimizer):
-    total_epoch = cfg.SOLVER.MAX_EPOCHS
-    gamma=cfg.SOLVER.GAMMA
-    step_size = max(1, total_epoch*2//3)
-    lr_scheduler = StepLR(optimizer, step_size=step_size, gamma=gamma)
+    sched_type = getattr(cfg.SOLVER, 'SCHEDULER', 'step')
+
+    if sched_type == 'step':
+        total_epoch = cfg.SOLVER.MAX_EPOCHS
+        gamma = cfg.SOLVER.GAMMA
+        step_size = max(1, total_epoch * 2 // 3)
+        lr_scheduler = StepLR(optimizer, step_size=step_size, gamma=gamma)
+    elif sched_type == 'cosine_warmup':
+        from project.solver.cosine_warmup import CosineWarmupLR
+        lr_scheduler = CosineWarmupLR(
+            optimizer,
+            warmup_epochs=cfg.SOLVER.WARMUP_EPOCHS,
+            max_epochs=cfg.SOLVER.MAX_EPOCHS,
+            min_lr=cfg.SOLVER.MIN_LR,
+        )
+    else:
+        raise ValueError(
+            f"Unknown scheduler type '{sched_type}'. Choose 'step' or 'cosine_warmup'."
+        )
+
     return lr_scheduler

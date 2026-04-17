@@ -149,6 +149,19 @@ _C.INPUT.PIXEL_STD = [0.229, 0.224, 0.225]
 _C.INPUT.PADDING = 10
 # if we want to resize the image before testing -- eval performance on different image size
 _C.INPUT.PRE_SCALING = None
+_C.INPUT.AUG_PROFILE = "weak"
+_C.INPUT.RESOLUTION = 224
+
+# -----------------------------------------------------------------------------
+# Data
+# -----------------------------------------------------------------------------
+_C.DATA = CN()
+_C.DATA.STORAGE_ROOT = ""
+_C.DATA.TRAIN_CSV = ""
+_C.DATA.VAL_CSV = ""
+_C.DATA.TEST_IID_CSV = ""
+_C.DATA.TEST_OOD_CSV = ""
+_C.DATA.SUBSAMPLE_PATH = ""
 
 # -----------------------------------------------------------------------------
 # Dataset
@@ -222,6 +235,8 @@ _C.SOLVER.WARMUP_EPOCHS = 0
 _C.SOLVER.WARMUP_METHOD = "linear"
 _C.SOLVER.WARMUP_LR = 1.25e-7
 
+_C.SOLVER.SCHEDULER = "step"          # 'step' | 'cosine_warmup'
+
 _C.SOLVER.COSINE_MARGIN = 0.5
 _C.SOLVER.COSINE_SCALE = 30
 
@@ -266,4 +281,11 @@ _C.TEST.FILTER_DATE = True
 # Misc options
 # ---------------------------------------------------------------------------- #
 # Path to checkpoint and saved log of trained model
+# ---------------------------------------------------------------------------- #
+# Eval
+# ---------------------------------------------------------------------------- #
+_C.EVAL = CN()
+_C.EVAL.CHECKPOINT_METRIC = "val_rank1"
+_C.EVAL.VAL_EVERY_N_EPOCHS = 2
+
 _C.OUTPUT_DIR = ""
