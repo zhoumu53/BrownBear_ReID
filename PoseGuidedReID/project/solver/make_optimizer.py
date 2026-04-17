@@ -4,24 +4,26 @@ import torch.optim as optim
 def make_optimizer(cfg, model):
 
     lr = cfg.SOLVER.BASE_LR
-    weight_decay = cfg.SOLVER.WEIGHT_DECAY_BIAS
-    momentum=cfg.SOLVER.MOMENTUM
+    wd = cfg.SOLVER.WEIGHT_DECAY
+    momentum = cfg.SOLVER.MOMENTUM
 
-    ignored_params = list(map(id, model.classifier.parameters() ))
+    ignored_params = list(map(id, model.classifier.parameters()))
     base_params = filter(lambda p: id(p) not in ignored_params, model.parameters())
     classifier_params = model.classifier.parameters()
-    params = [ 
-                {'params': base_params, 'lr': 0.1 * lr},
-                {'params': classifier_params, 'lr': lr}
-                ]
-    
-    if cfg.SOLVER.OPTIMIZER_NAME == 'SGD':
-        optimizer = optim.SGD(params, weight_decay=weight_decay, momentum=momentum, nesterov=True)
-    elif cfg.SOLVER.OPTIMIZER_NAME == 'AdamW':
-        optimizer = optim.AdamW(params, weight_decay=weight_decay)
+    params = [
+        {'params': base_params, 'lr': 0.1 * lr},
+        {'params': classifier_params, 'lr': lr},
+    ]
+
+    name = cfg.SOLVER.OPTIMIZER_NAME
+    if name == 'SGD':
+        optimizer = optim.SGD(params, momentum=momentum, weight_decay=wd, nesterov=True)
+    elif name == 'Adam':
+        optimizer = optim.Adam(params, weight_decay=wd)
+    elif name == 'AdamW':
+        optimizer = optim.AdamW(params, weight_decay=wd)
     else:
-        optimizer = getattr(optim, cfg.SOLVER.OPTIMIZER_NAME)(params, weight_decay=weight_decay)
-    
+        raise ValueError(f"Unsupported optimizer: {name}. Choose from Adam, AdamW, SGD.")
 
     return optimizer
 
