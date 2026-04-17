@@ -570,3 +570,148 @@ def do_prediction(cfg,
     print("predictions save to :", result_path)
 
     return df_results
+
+
+# ---------------------------------------------------------------------------
+# do_train_v2 – training loop with val-Rank-1 checkpoint selection
+# ---------------------------------------------------------------------------
+from pathlib import Path
+from project.processor.validator import compute_val_rank1
+from project.utils.run_output import write_metrics
+
+_logger_v2 = logging.getLogger(__name__)
+
+
+def do_train_v2(cfg, model, train_loader, val_loader, optimizer, scheduler, loss_fn, device, output_paths):
+    """Training loop with validation Rank-1 checkpoint selection and TensorBoard logging.
+
+    Parameters
+    ----------
+    cfg : config object
+        Must expose ``cfg.SOLVER.MAX_EPOCHS``, ``cfg.EVAL.VAL_EVERY_N_EPOCHS``,
+        and ``cfg.EVAL.CHECKPOINT_METRIC``.
+    model : nn.Module
+        Forward returns ``(logits, features)`` or ``[logits, features, ...]``.
+    train_loader : DataLoader
+        Yields dicts with keys ``"image"`` and ``"pid"``.
+    val_loader : DataLoader
+        Passed to :func:`compute_val_rank1`.  May be empty.
+    optimizer, scheduler : standard PyTorch objects.
+    loss_fn : callable
+        Signature ``loss_fn(logits, pids, feat) -> Tensor``.
+    device : torch.device or str
+    output_paths : dict[str, Path]
+        From :func:`init_run_output` – keys: root, checkpoints, tensorboard, log, metrics.
+
+    Returns
+    -------
+    dict
+        Final metrics (best_epoch, best_val_rank1, final_train_loss, final_train_acc, total_epochs).
+    """
+    max_epochs = cfg.SOLVER.MAX_EPOCHS
+    val_every = cfg.EVAL.VAL_EVERY_N_EPOCHS
+
+    from torch.utils.tensorboard import SummaryWriter
+    writer = SummaryWriter(log_dir=str(output_paths["tensorboard"]))
+
+    model.to(device)
+    model.train()
+
+    best_metric_value = -1.0
+    best_epoch = -1
+    global_step = 0
+
+    # Check if val_loader is usable
+    has_val = val_loader is not None and len(val_loader) > 0
+
+    for epoch in range(max_epochs):
+        model.train()
+        running_loss = 0.0
+        running_correct = 0
+        running_total = 0
+
+        for batch in train_loader:
+            imgs = batch["image"].to(device)
+            pids = batch["pid"].to(device)
+
+            optimizer.zero_grad()
+
+            out = model(imgs)
+            # Model may return tuple or list: (logits, features) or (logits, features, ...)
+            if isinstance(out, (tuple, list)):
+                logits = out[0]
+                feat = out[1]
+            else:
+                logits = out
+                feat = out
+
+            loss = loss_fn(logits, pids, feat)
+            loss.backward()
+            optimizer.step()
+
+            # --- bookkeeping ---
+            batch_size = pids.size(0)
+            running_loss += loss.item() * batch_size
+            preds = logits.argmax(dim=1)
+            running_correct += (preds == pids).sum().item()
+            running_total += batch_size
+
+            writer.add_scalar("train/step_loss", loss.item(), global_step)
+            global_step += 1
+
+        scheduler.step()
+
+        epoch_loss = running_loss / max(running_total, 1)
+        epoch_acc = running_correct / max(running_total, 1)
+        current_lr = optimizer.param_groups[0]["lr"]
+
+        writer.add_scalar("train/epoch_loss", epoch_loss, epoch)
+        writer.add_scalar("train/epoch_acc", epoch_acc, epoch)
+        writer.add_scalar("train/lr", current_lr, epoch)
+
+        _logger_v2.info(
+            "Epoch %d/%d  loss=%.4f  acc=%.4f  lr=%.6f",
+            epoch + 1, max_epochs, epoch_loss, epoch_acc, current_lr,
+        )
+
+        # --- validation ---
+        is_val_epoch = (
+            has_val
+            and ((epoch + 1) % val_every == 0 or (epoch + 1) == max_epochs)
+        )
+        if is_val_epoch:
+            val_rank1 = compute_val_rank1(model, val_loader, device)
+            writer.add_scalar("val/rank1", val_rank1, epoch)
+            _logger_v2.info("  val Rank-1 = %.4f", val_rank1)
+
+            if val_rank1 > best_metric_value:
+                best_metric_value = val_rank1
+                best_epoch = epoch + 1
+                best_ckpt_path = Path(output_paths["checkpoints"]) / "best.pth"
+                torch.save(
+                    {"model_state_dict": model.state_dict(), "epoch": epoch + 1, "val_rank1": val_rank1},
+                    best_ckpt_path,
+                )
+                _logger_v2.info("  -> new best checkpoint saved (epoch %d, rank1=%.4f)", epoch + 1, val_rank1)
+
+    # --- save final checkpoint ---
+    final_ckpt_path = Path(output_paths["checkpoints"]) / "final.pth"
+    torch.save(
+        {"model_state_dict": model.state_dict(), "epoch": max_epochs},
+        final_ckpt_path,
+    )
+    _logger_v2.info("Final checkpoint saved to %s", final_ckpt_path)
+
+    # --- write metrics ---
+    metrics = {
+        "best_epoch": best_epoch,
+        "best_val_rank1": best_metric_value,
+        "final_train_loss": epoch_loss,
+        "final_train_acc": epoch_acc,
+        "total_epochs": max_epochs,
+    }
+    write_metrics(output_paths["root"], metrics)
+
+    writer.close()
+
+    return metrics
