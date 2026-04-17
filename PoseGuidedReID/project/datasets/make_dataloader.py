@@ -182,3 +182,68 @@ def make_base_dataloader(cfg,
     loader = create_dataloader(image_set, batch_size, cfg.DATALOADER.NUM_WORKERS, is_train=is_train)
     return loader, dataset.n_classes, len(dataset.cid_container)
 
+
+# ---------------------------------------------------------------------------
+# CSV-based dataloaders (aug profile + subsample support)
+# ---------------------------------------------------------------------------
+from .csv_dataset import CsvHeadsDataset
+from .subsample import load_subsample
+from .transforms_v2 import build_train_transform, build_eval_transform
+
+
+def _dict_collate(batch):
+    import torch as _t
+    out = {}
+    for k in batch[0]:
+        if isinstance(batch[0][k], _t.Tensor):
+            out[k] = _t.stack([b[k] for b in batch])
+        else:
+            out[k] = [b[k] for b in batch]
+    if "pid" in out and not isinstance(out["pid"], _t.Tensor):
+        out["pid"] = _t.tensor(out["pid"])
+    return out
+
+
+def make_csv_dataloaders(cfg):
+    """Build train + val dataloaders from CSV splits.
+    Returns (train_loader, val_loader, num_classes).
+    """
+    train_tf = build_train_transform(cfg.INPUT.AUG_PROFILE, resolution=cfg.INPUT.RESOLUTION)
+    eval_tf = build_eval_transform(resolution=cfg.INPUT.RESOLUTION)
+
+    sub = None
+    sub_path = getattr(cfg.DATA, "SUBSAMPLE_PATH", "") or ""
+    if sub_path:
+        sub = load_subsample(sub_path)
+
+    train_ds = CsvHeadsDataset(
+        csv_path=cfg.DATA.TRAIN_CSV,
+        storage_root=cfg.DATA.STORAGE_ROOT,
+        transform=train_tf,
+        subsample_rows=sub,
+    )
+    val_ds = CsvHeadsDataset(
+        csv_path=cfg.DATA.VAL_CSV,
+        storage_root=cfg.DATA.STORAGE_ROOT,
+        transform=eval_tf,
+        subsample_rows=sub,
+    )
+
+    # PK sampler — RandomIdentitySampler expects (_, pid, _, _) tuples
+    pk_tuples = [(None, train_ds._pid_map[r["pid"]], None, None) for r in train_ds._records]
+    sampler = RandomIdentitySampler(pk_tuples, cfg.SOLVER.IMS_PER_BATCH, cfg.DATALOADER.NUM_INSTANCE)
+
+    train_loader = DataLoader(
+        train_ds, batch_size=cfg.SOLVER.IMS_PER_BATCH,
+        sampler=sampler, num_workers=cfg.DATALOADER.NUM_WORKERS,
+        collate_fn=_dict_collate,
+        persistent_workers=cfg.DATALOADER.NUM_WORKERS > 0,
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=cfg.SOLVER.IMS_PER_BATCH,
+        shuffle=False, num_workers=cfg.DATALOADER.NUM_WORKERS,
+        collate_fn=_dict_collate,
+        persistent_workers=cfg.DATALOADER.NUM_WORKERS > 0,
+    )
+    return train_loader, val_loader, train_ds.num_classes
+
