@@ -1,287 +1,230 @@
-from project.utils.logger import setup_logger
-from project.datasets import make_dataloader, make_base_dataloader
-from project.models import make_model
-from project.solver import make_optimizer
-from project.solver.scheduler_factory import create_scheduler
-from project.losses import make_loss
+#!/usr/bin/env python3
+"""Config-driven training CLI for Pose-Guided ReID.
 
-import random
-import torch
-import torch.optim as optim
-import numpy as np
-import os
+Usage
+-----
+python tools/train.py \
+    --config configs/experiments/01_fixes_only.yaml \
+    --output runs/01_fixes_only/ \
+    [--epochs N] [--device auto|mps|cuda|cpu] [--num-workers N]
+"""
+from __future__ import annotations
+
 import argparse
-from project.config import cfg
+import logging
+import random
 import sys
-import glob
-from project.utils.tools import load_model, setup_ddp_training, fuse_all_conv_bn
-from project.processor.processor import train_model, do_inference, get_DDP_model
-from tools.evaluation import run_evaluation
-from tools.evaluation_katmai import run_evaluation as run_evaluation_katmai
-from project.utils.wandb_tools import WandbLogger
-import shutil
-import wandb
-wandb.login()
+from pathlib import Path
+
+import numpy as np
+import torch
+
+# ---------------------------------------------------------------------------
+# sys.path: allow ``from project.…`` imports when run from tools/
+# ---------------------------------------------------------------------------
+THIS_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(THIS_DIR.parent))  # adds PoseGuidedReID/ to path
+
+from project.config.loader import load_config
+from project.config.defaults import _C
+from project.datasets.make_dataloader import make_csv_dataloaders
+from project.models import make_model
+from project.losses.make_loss import make_loss
+from project.solver.make_optimizer import make_optimizer
+from project.solver.scheduler_factory import create_scheduler
+from project.processor.processor import do_train_v2
+from project.utils.device import get_device
+from project.utils.run_output import init_run_output
+
+logger = logging.getLogger("train")
 
 
-def set_seed(seed):
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _apply_yaml_to_cfg(yaml_dict: dict, cfg_node) -> None:
+    """Recursively walk *yaml_dict* and set matching fields on *cfg_node*.
+
+    Keys in *yaml_dict* must match the yacs CfgNode hierarchy exactly.
+    Type enforcement is handled by yacs itself on assignment.
+    """
+    for key, value in yaml_dict.items():
+        if not hasattr(cfg_node, key):
+            raise KeyError(
+                f"YAML key {key!r} not found in config node "
+                f"(available: {list(cfg_node.keys())})"
+            )
+        sub = getattr(cfg_node, key)
+        if isinstance(value, dict):
+            # Recurse into the sub-node
+            _apply_yaml_to_cfg(value, sub)
+        else:
+            setattr(cfg_node, key, value)
+
+
+def _build_loss_fn(cfg, num_classes):
+    """Build a loss callable with signature ``loss_fn(logits, pids, feat) -> Tensor``.
+
+    ``make_loss()`` returns ``(criterion_ce, criterion_triplet)``.
+    ``do_train_v2`` calls ``loss_fn(logits, pids, feat)``.
+
+    We combine CE + triplet with configurable weights (matching the legacy
+    ``make_loss_old`` behaviour).
+    """
+    criterion_ce, criterion_triplet = make_loss()
+
+    id_weight = cfg.MODEL.ID_LOSS_WEIGHT
+    tri_weight = cfg.MODEL.TRIPLET_LOSS_WEIGHT
+
+    def loss_fn(logits, pids, feat):
+        # logits may be a list [logits, ...] from multi-branch heads
+        if isinstance(logits, (list, tuple)):
+            ce = criterion_ce(logits[0], pids)
+        else:
+            ce = criterion_ce(logits, pids)
+
+        tri = criterion_triplet(feat, pids)
+
+        return id_weight * ce + tri_weight * tri
+
+    return loss_fn
+
+
+def _setup_logging(log_path: Path | None = None) -> None:
+    """Configure root + ``train`` logger to stderr (+ optional file)."""
+    fmt = logging.Formatter(
+        "%(asctime)s %(name)s %(levelname)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+
+    sh = logging.StreamHandler(sys.stderr)
+    sh.setFormatter(fmt)
+    root.addHandler(sh)
+
+    if log_path is not None:
+        fh = logging.FileHandler(str(log_path))
+        fh.setFormatter(fmt)
+        root.addHandler(fh)
+
+
+def _set_seed(seed: int) -> None:
     torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
     random.seed(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = True
 
-if __name__ == '__main__':
 
-    parser = argparse.ArgumentParser(description="ReID Baseline Training")
-    parser.add_argument(
-        "--config_file", default="", help="path to config file", type=str
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Pose-Guided ReID -- config-driven training",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+    p.add_argument("--config", required=True, help="Path to YAML experiment config")
+    p.add_argument("--output", required=True, help="Run output directory")
+    p.add_argument("--epochs", type=int, default=None, help="Override SOLVER.MAX_EPOCHS")
+    p.add_argument(
+        "--device",
+        choices=["auto", "mps", "cuda", "cpu"],
+        default="auto",
+        help="Device preference",
+    )
+    p.add_argument("--num-workers", type=int, default=None, help="Override DATALOADER.NUM_WORKERS")
+    return p.parse_args(argv)
 
-    parser.add_argument("opts", help="Modify config options using the command-line", default=None,
-                        nargs=argparse.REMAINDER)
-    parser.add_argument("--local_rank", default=0, type=int)
-    parser.add_argument("--notes", default="training...", type=str)
-    parser.add_argument("--out_dim", default=512, type=int)
-    parser.add_argument("--do_inference", action='store_true', help='do inference on the dataset (train/test_iid/test_ood)')
-    parser.add_argument("--do_evaluation", action='store_true', help='evaluate the model on the dataset (ood/iid vs gallery)')
-    parser.add_argument("--do_prediction", action='store_true', help='do inference on the dataset (train/test_iid/test_ood)')
-    parser.add_argument("--do_training", action='store_true', help='train the model')
-    parser.add_argument("--data_type", default=None, type=str)
-    parser.add_argument("--model_name", default="", type=str)
-    parser.add_argument("--wb_run_id", default=None, type=str)
-    args = parser.parse_args()
 
-    if args.config_file != "":
-        cfg.merge_from_file(args.config_file)
-    cfg.merge_from_list(args.opts)
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
+
+    # 1. Load YAML config ------------------------------------------------
+    yaml_dict = load_config(args.config)
+
+    # 2. Merge YAML into yacs defaults -----------------------------------
+    cfg = _C.clone()
+    cfg.defrost()
+    _apply_yaml_to_cfg(yaml_dict, cfg)
+
+    # 3. Apply CLI overrides ---------------------------------------------
+    if args.epochs is not None:
+        cfg.SOLVER.MAX_EPOCHS = args.epochs
+    if args.num_workers is not None:
+        cfg.DATALOADER.NUM_WORKERS = args.num_workers
+    cfg.OUTPUT_DIR = args.output
+
+    # Device is resolved separately (not stored in yacs cfg)
+    device = get_device(args.device)
+
+    # 4. Freeze config ---------------------------------------------------
     cfg.freeze()
 
-    set_seed(cfg.SOLVER.SEED)
+    # 5. Init run output -------------------------------------------------
+    frozen_dict = yaml_dict  # already a plain dict suitable for YAML dump
+    output_paths = init_run_output(args.output, frozen_dict)
 
-    local_rank = args.local_rank
+    # 6. Logging ---------------------------------------------------------
+    _setup_logging(output_paths["log"])
+    logger.info("Config: %s", args.config)
+    logger.info("Output: %s", args.output)
+    logger.info("Device: %s", device)
+    logger.info("Frozen config:\n%s", cfg)
 
-    output_dir = cfg.OUTPUT_DIR
+    # 7. Seed ------------------------------------------------------------
+    _set_seed(cfg.SOLVER.SEED)
 
-    exp_name = output_dir.split('/')[-1]  ### 'test_on_20xx'
-    full_data = output_dir.split('/')[-3].split('_')[1]
-    project_name = full_data + '_' + output_dir.split('/')[-2]  ### e.g. '5years_swin_triplet_inference_eval'
-    
-    wb_run=None
-    wb_run_id=args.wb_run_id
-    if local_rank == 0:
-        if args.do_training:
-            exp_name = exp_name + '_train'
-        if args.do_inference:
-            exp_name = exp_name + '_inf'
+    # 8. Dataloaders -----------------------------------------------------
+    train_loader, val_loader, num_classes = make_csv_dataloaders(cfg)
+    logger.info("Dataloaders ready -- %d train batches, %d val batches, %d classes",
+                len(train_loader), len(val_loader), num_classes)
 
-        wb = WandbLogger(cfg)
-        wb_config = wb.build_config(cfg, args.config_file, exp_name, project_name, output_dir)
-        if wb_run_id is None:
-            wb_run = wb.init_wandb(project_name, exp_name, wb_config, notes=args.notes)
-            wb_run_id = wb_run.id
-        else:
-            wb_run = wb.resume(run_id=wb_run_id, resume='allow')
-        
-    if_train = args.do_training
-    
-    logger = setup_logger("project", output_dir, if_train=if_train)
-    logger.info("Saving model in the path :{}".format(cfg.OUTPUT_DIR))
-    logger.info(args)
-    logger.info("Running with config:\n{}".format(cfg))
-    # device = 'cuda'
+    # 9. Model -----------------------------------------------------------
+    #    make_model reads cfg.MODEL.* extensively. We need to temporarily
+    #    set NUM_CLASSES if the config hierarchy requires it, but make_model
+    #    takes num_classes as an explicit argument.
+    model = make_model(
+        cfg,
+        num_classes=num_classes,
+        logger=logger,
+        load_weights=True,
+        return_feature=True,
+        device=str(device),
+    )
+    model = model.to(device)
+    logger.info("Model built and moved to %s", device)
 
-    # if os.path.exists(output_dir):
-    #     files = glob.glob(output_dir + '/*.pth')
-    #     if len(files) > 0:
-    #         print('You already trained the model. Now loading the model from the trained ckp.')
-    #         # sys.exit("You already trained the model. Please change another output_dir for logging.")
-    # else:
-    #     os.makedirs(output_dir)
-
-    if cfg.MODEL.DIST_TRAIN:
-        local_rank, world_size, device = setup_ddp_training()
-    else:
-        device_ids = cfg.MODEL.DEVICE_ID[0]
-        device = torch.device("cuda:{}".format(device_ids))
-
-    ### copy the swinT model to the output_dir
-    if args.do_training:
-        if cfg.MODEL.TYPE == 'swin':
-            shutil.copy(f'{os.getcwd()}/project/models/backbones/swin_transformer.py', os.path.join(output_dir, 'swin_transformer.py'))
-        elif cfg.MODEL.TYPE == 'swinv2':
-            shutil.copy(f'{os.getcwd()}/project/models/backbones/swin_transformer_v2.py', os.path.join(output_dir, 'swin_transformer_v2.py'))
-
-    if cfg.DATASETS.NAMES == 'bear' or cfg.DATASETS.NAMES == 'macaque':
-        train_loader, train_loader_normal, \
-            test_iid_loader, test_ood_loader, val_iid_loader, \
-                all_classes, camera_num, \
-                    train_num_classes, test_iid_num_classes, test_ood_num_classes, val_iid_num_classes= make_dataloader(cfg)
-    elif cfg.DATASETS.NAMES == 'base':
-        train_loader, train_num_classes, camera_num = make_base_dataloader(cfg, 
-                                                                           is_train=args.do_training, 
-                                                                           root_dir=cfg.DATASETS.ROOT_DIR,
-                                                                           img_dir=cfg.DATASETS.IMG_DIR)
-    
-
-    model = make_model(cfg, 
-                       num_classes=train_num_classes, 
-                       logger=logger, 
-                       return_feature=True, 
-                       device=device, 
-                       camera_num=camera_num)
-
-    criterion, criterion_triplet = make_loss()
+    # 10. Optimizer + scheduler ------------------------------------------
     optimizer = make_optimizer(cfg, model)
     scheduler = create_scheduler(cfg, optimizer)
 
-    if args.do_training:
-        train_model(cfg, 
-                    train_loader,
-                    model, 
-                    criterion, 
-                    criterion_triplet,
-                    optimizer, 
-                    scheduler, 
-                    local_rank=local_rank,
-                    device=device,
-                    wb_run=wb_run)
-    
+    # 11. Loss -----------------------------------------------------------
+    loss_fn = _build_loss_fn(cfg, num_classes)
 
-    ################### INFERENCE & SAVE IMAGE FEATURES FOR EVALUATION #####################
+    # 12. Train ----------------------------------------------------------
+    logger.info("Starting training for %d epochs", cfg.SOLVER.MAX_EPOCHS)
+    metrics = do_train_v2(
+        cfg, model, train_loader, val_loader,
+        optimizer, scheduler, loss_fn, device, output_paths,
+    )
 
-    if args.do_inference:
-        
-        ### run inference on val_iid and val_ood (save feature only)
-        model_weights_path = cfg.TEST.WEIGHT
-        if model_weights_path is None or model_weights_path == '':
-            model_weights_path = os.path.join(cfg.OUTPUT_DIR, 'net_last.pth')
-            
-        if cfg.DATASETS.NAMES == 'bear' or cfg.DATASETS.NAMES == 'macaque':
-            
-            is_swin = True if 'swin' in cfg.MODEL.TYPE else False
-            
-            data_type = 'val_iid'
-            model_structure = make_model(cfg, 
-                                         num_classes=val_iid_num_classes, 
-                                         logger=logger, 
-                                         return_feature=True, 
-                                         device=device, 
-                                         camera_num=camera_num)
-            model = load_model(model_structure, 
-                              model_weights_path, 
-                              logger=logger, 
-                              remove_fc=True, 
-                              local_rank=local_rank, 
-                              is_swin=is_swin)
-            model.eval()
-            model = fuse_all_conv_bn(model).to(device)
-            iid_feature_path = do_inference(cfg, 
-                                            model, 
-                                            val_iid_loader, 
-                                            data_type=data_type, 
-                                            out_dir=cfg.OUTPUT_DIR, 
-                                            local_rank=local_rank, 
-                                            device=device)
-            
-            data_type = 'test_iid'
-            model_structure = make_model(cfg, 
-                                         num_classes=test_iid_num_classes, 
-                                         logger=logger, 
-                                         return_feature=True, 
-                                         device=device, 
-                                         camera_num=camera_num)
-            model = load_model(model_structure, 
-                              model_weights_path, 
-                              logger=logger, 
-                              remove_fc=True, local_rank=local_rank, is_swin=is_swin)
-            model.eval()
-            model = fuse_all_conv_bn(model).to(device)
-            iid_feature_path = do_inference(cfg, 
-                                            model, 
-                                            test_iid_loader, 
-                                            data_type=data_type, 
-                                            out_dir=cfg.OUTPUT_DIR, 
-                                            local_rank=local_rank, 
-                                            device=device,
-                                            camera_num=camera_num)
+    # 13. Log final metrics ----------------------------------------------
+    if metrics:
+        logger.info("Training complete. Final metrics: %s", metrics)
+    else:
+        logger.info("Training complete.")
 
-            data_type = 'test_ood'
-            model_structure = make_model(cfg, 
-                                         num_classes=test_ood_num_classes, 
-                                         logger=logger, 
-                                         return_feature=True, 
-                                         device=device,
-                                         camera_num=camera_num)
-            model = load_model(model_structure, 
-                              model_weights_path, 
-                              logger=logger, remove_fc=True, local_rank=local_rank, is_swin=is_swin)
-            model.eval()
-            model = fuse_all_conv_bn(model).to(device)
-            ood_feature_path = do_inference(cfg, 
-                                            model, 
-                                            test_ood_loader, 
-                                            data_type=data_type, 
-                                            out_dir=cfg.OUTPUT_DIR, 
-                                            local_rank=local_rank, 
-                                            device=device)
 
-            data_type = 'train_iid'
-            model_structure = make_model(cfg, 
-                                         num_classes=train_num_classes, 
-                                         logger=logger, 
-                                         return_feature=True, 
-                                         device=device,
-                                         camera_num=camera_num)
-            model = load_model(model_structure, 
-                              model_weights_path, 
-                              logger=logger, 
-                              remove_fc=True, 
-                              local_rank=local_rank, 
-                              is_swin=is_swin)
-            model.eval()
-            model = fuse_all_conv_bn(model).to(device)
-            train_feature_path = do_inference(cfg, 
-                                                model, 
-                                                train_loader_normal, 
-                                                data_type=data_type, 
-                                                out_dir=cfg.OUTPUT_DIR, 
-                                                local_rank=local_rank, 
-                                                device=device)
-            
-        elif cfg.DATASETS.NAMES == 'base':
-            
-            ## run inference on train dataset
-            data_type = 'train_iid'
-            model_structure = make_model(cfg, num_classes=train_num_classes, logger=logger, return_feature=True, device=device, camera_num=camera_num)
-            model = load_model(model_structure, model_weights_path, logger=logger, remove_fc=True, local_rank=local_rank)
-            model.eval()
-            model = fuse_all_conv_bn(model).to(device)
-            train_feature_path = do_inference(cfg, 
-                                                model, 
-                                                train_loader, 
-                                                data_type=data_type, 
-                                                out_dir=cfg.OUTPUT_DIR, 
-                                                local_rank=local_rank, 
-                                                device=device)
-            
-            data_type = 'test_katmai' if args.data_type == 'katmai' else 'test'
-            print("cfg.DATASETS.TEST_ROOT_DIR, cfg.DATASETS.TEST_IMG_DIR", cfg.DATASETS.TEST_ROOT_DIR, cfg.DATASETS.TEST_IMG_DIR)
-            dataloader, n_classes, camera_num = make_base_dataloader(cfg, 
-                                                         is_train=False, 
-                                                         root_dir=cfg.DATASETS.TEST_ROOT_DIR, 
-                                                         img_dir=cfg.DATASETS.TEST_IMG_DIR
-                                                         )
-            model_structure = make_model(cfg, num_classes=n_classes, logger=logger, return_feature=True, device=device, camera_num=camera_num)
-            model = load_model(model_structure, model_weights_path, logger=logger, remove_fc=True, local_rank=local_rank)
-            model.eval()
-            model = fuse_all_conv_bn(model).to(device)
-            test_feature_path = do_inference(cfg, 
-                                                model, 
-                                                dataloader, 
-                                                data_type=data_type, 
-                                                out_dir=cfg.OUTPUT_DIR, 
-                                                local_rank=local_rank, 
-                                                device=device)
+if __name__ == "__main__":
+    main()
