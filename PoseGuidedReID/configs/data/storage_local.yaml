@@ -1,0 +1,7 @@
+DATA:
+  STORAGE_ROOT: /Users/makibot/projects/brown-bear-server/storage/heads
+  TRAIN_CSV: /Users/makibot/Desktop/Public_release/data/reid_annotations/test_on_2017/train_iid.csv
+  VAL_CSV: /Users/makibot/Desktop/Public_release/data/reid_annotations/test_on_2017/val_iid.csv
+  TEST_IID_CSV: /Users/makibot/Desktop/Public_release/data/reid_annotations/test_on_2017/test_iid.csv
+  TEST_OOD_CSV: /Users/makibot/Desktop/Public_release/data/reid_annotations/test_on_2017/test_ood.csv
+  SUBSAMPLE_PATH: ""
