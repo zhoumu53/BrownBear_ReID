@@ -1,0 +1,15 @@
+_base_: 00_baseline_current.yaml
+
+DATA:
+  SUBSAMPLE_PATH: configs/data/subsample_6ids_smoke.json
+
+SOLVER:
+  IMS_PER_BATCH: 16
+  MAX_EPOCHS: 1
+
+DATALOADER:
+  NUM_INSTANCE: 4
+  NUM_WORKERS: 0
+
+EVAL:
+  VAL_EVERY_N_EPOCHS: 1

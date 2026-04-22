@@ -153,9 +153,10 @@ def get_swin_model(num_classes, cfg, logger, load_weights=True, device='cuda'):
                                 fused_window_process=cfg.FUSED_WINDOW_PROCESS,
                                 cfg=cfg,
                                 pose_model=pose_model)
-        if load_weights:
+        if load_weights and cfg.MODEL.PRETRAIN_PATH:
             load_pretrained(cfg, model, logger, device=device)
-            # model.load_state_dict(torch.load(cfg.MODEL.PRETRAIN_PATH))
+        elif load_weights:
+            logger.info("No PRETRAIN_PATH set; starting from random weights.")
 
     elif model_type == 'swinv2':
         if cfg.MODEL.AGG_POSE_FEATURE:
@@ -182,9 +183,10 @@ def get_swin_model(num_classes, cfg, logger, load_weights=True, device='cuda'):
                                 pose_model=pose_model)
         model.to(device)
         print('model.device', 'device', device)
-        if load_weights:
+        if load_weights and cfg.MODEL.PRETRAIN_PATH:
             load_pretrained(cfg, model, logger, device=device)
-            # model.load_state_dict(torch.load(cfg.MODEL.PRETRAIN_PATH))
+        elif load_weights:
+            logger.info("No PRETRAIN_PATH set; starting from random weights.")
     else:
         raise NotImplementedError(f"Unkown model: {model_type}")
     
